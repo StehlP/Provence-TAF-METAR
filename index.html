@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>METAR TAF Provence</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<style>
+  :root { --blue:#1ea0e6; --navy:#0a1a4a; --cream:#fffff0; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; font-family:Verdana, Arial, sans-serif; background:#cfd6dc; }
+  #page {
+    display:grid; height:100vh; gap:8px; padding:8px;
+    grid-template-columns: minmax(260px,22vw) 1fr minmax(260px,22vw);
+    grid-template-rows: auto 1fr auto;
+    grid-template-areas: "top top top" "left map right" "bot bot bot";
+  }
+  #top,#bot { display:flex; gap:8px; }
+  #top{grid-area:top} #bot{grid-area:bot}
+  #left{grid-area:left} #right{grid-area:right}
+  #left,#right { display:flex; flex-direction:column; justify-content:center; gap:8px; }
+  #top .card,#bot .card { flex:1; min-width:0; }
+  #map { grid-area:map; border:2px solid var(--blue); min-height:200px; }
+  #lines { position:fixed; inset:0; width:100%; height:100%; pointer-events:none; z-index:500; }
+  .card {
+    position:relative; z-index:600; background:var(--cream); color:var(--navy);
+    border:3px solid var(--blue); box-shadow:4px 4px 0 rgba(0,0,0,.35);
+    font-size:11px; line-height:1.35;
+  }
+  .card h2 { margin:0; background:var(--blue); color:#000; font-size:13px; padding:3px 6px; font-weight:bold; }
+  .card h2 small { font-weight:normal; }
+  .card h2 .tc { float:right; background:#fff!important; color:#000!important; font-size:11px; padding:0 6px; border:1px solid #000; }
+  .card .body { padding:4px 7px 6px; font-weight:bold; word-wrap:break-word; }
+  .card .lbl { font-size:14px; font-weight:bold; }
+  .card .taf { margin-top:4px; color:#4a5068; background:#f3f3ec; padding:1px 3px; }
+  .card .err { color:#b00; }
+  .icao-lbl { background:var(--blue); color:#fff; font:bold 11px Verdana; padding:1px 3px; white-space:nowrap; border:1px solid #fff; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--blue); border:2px solid #fff; }
+  #status { position:fixed; right:12px; bottom:4px; font-size:10px; color:#333; z-index:700; }
+  /* Mode "sur la carte" : carte plein écran, encarts à côté des AD */
+  body.onmap #page { grid-template-columns:1fr; grid-template-rows:1fr; grid-template-areas:"map"; }
+  body.onmap #top, body.onmap #bot, body.onmap #left, body.onmap #right { display:contents; }
+  body.onmap .card { position:fixed; width:250px; font-size:10px; line-height:1.3; }
+  body.onmap .card .lbl { font-size:12px; }
+  body.onmap .card h2 { font-size:12px; padding:2px 5px; }
+  @media (max-width:800px){
+    body.onmap .card { position:relative; width:auto; left:auto!important; top:auto!important; }
+    body.onmap #page { display:flex; }
+    #page { display:flex; flex-direction:column; height:auto; }
+    #top,#bot,#left,#right { flex-direction:column; }
+    #map { height:60vh; order:-1; }
+    #lines { display:none; }
+  }
+</style>
+</head>
+<body class="onmap">
+<div id="page">
+  <div id="top"></div>
+  <div id="left"></div>
+  <div id="map"></div>
+  <div id="right"></div>
+  <div id="bot"></div>
+</div>
+<svg id="lines"></svg>
+<div id="status">Chargement…</div>
+
+<script>
+// Placement des cartes autour de la carte, selon la géographie
+const AD = [
+  {id:'LFTW', name:'NIMES GARONS',        lat:43.7574, lon:4.4163, slot:'top'},
+  {id:'LFMO', name:'ORANGE CARITAT',      lat:44.1405, lon:4.8667, slot:'top'},
+  {id:'LFMV', name:'AVIGNON CAUMONT',     lat:43.9073, lon:4.9018, slot:'top'},
+  {id:'LFMY', name:'SALON DE PROVENCE',   lat:43.6064, lon:5.1093, slot:'top'},
+  {id:'LFMT', name:'MONTPELLIER',         lat:43.5762, lon:3.9630, slot:'left'},
+  {id:'LFMC', name:'LE LUC LE CANNET',    lat:43.3847, lon:6.3872, slot:'right'},
+  {id:'LFMI', name:'ISTRES LE TUBE',      lat:43.5227, lon:4.9238, slot:'bot'},
+  {id:'LFML', name:'MARSEILLE PROVENCE',  lat:43.4393, lon:5.2214, slot:'bot'},
+  {id:'LFTH', name:'TOULON HYERES',       lat:43.0973, lon:6.1460, slot:'bot'},
+];
+
+const map = L.map('map', {zoomControl:true});
+L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}', {
+  maxZoom:13, attribution:'Tiles © Esri'
+}).addTo(map);
+
+AD.forEach(a => {
+  const html = `<div style="display:flex;flex-direction:column;align-items:center"><span class="icao-lbl">${a.id}</span><div class="dot"></div></div>`;
+  a.marker = L.marker([a.lat,a.lon], {icon:L.divIcon({html, className:'', iconSize:[40,30], iconAnchor:[20,25]})}).addTo(map);
+  const c = document.createElement('div');
+  c.className = 'card';
+  c.innerHTML = `<h2>${a.id} <small>– ${a.name}</small><span class="tc" style="display:none"></span></h2><div class="body">Chargement…</div>`;
+  document.getElementById(a.slot).appendChild(c);
+  a.card = c;
+});
+
+const onMap = () => document.body.classList.contains('onmap') && innerWidth > 800;
+function fit(){
+  const pts = AD.map(a=>[a.lat,a.lon]);
+  if (onMap()) map.fitBounds(pts, {paddingTopLeft:[270,130], paddingBottomRight:[270,150]});
+  else map.fitBounds(pts, {padding:[30,30]});
+}
+
+// Placement des encarts à côté des AD : sans chevauchement, en évitant que les traits se croisent
+// ou passent sous un autre encart. On essaie plusieurs ordres de placement et on garde le meilleur.
+function segHit(a, b, c, d){ // les segments ab et cd se croisent-ils ?
+  const o = (p, q, r) => Math.sign((q.x-p.x)*(r.y-p.y) - (q.y-p.y)*(r.x-p.x));
+  return o(a,b,c) !== o(a,b,d) && o(c,d,a) !== o(c,d,b);
+}
+function segRect(a, b, r){ // le segment ab traverse-t-il le rectangle r ?
+  const inside = p => p.x > r.x && p.x < r.x + r.w && p.y > r.y && p.y < r.y + r.h;
+  if (inside(a) || inside(b)) return true;
+  const c = [{x:r.x,y:r.y},{x:r.x+r.w,y:r.y},{x:r.x+r.w,y:r.y+r.h},{x:r.x,y:r.y+r.h}];
+  return c.some((p,i) => segHit(a, b, p, c[(i+1)%4]));
+}
+const anchor = (p, r) => ({x: Math.min(Math.max(p.x, r.x), r.x + r.w), y: Math.min(Math.max(p.y, r.y), r.y + r.h)});
+
+function placeCards(){
+  if (!onMap()) { AD.forEach(a => { a.card.style.left = a.card.style.top = ''; }); return; }
+  const mr = document.getElementById('map').getBoundingClientRect();
+  const M = 6;
+  const hit = (a, b) => a.x < b.x + b.w + M && b.x < a.x + a.w + M && a.y < b.y + b.h + M && b.y < a.y + a.h + M;
+  const pts = AD.map(a => { const p = map.latLngToContainerPoint([a.lat,a.lon]); return {x: mr.left + p.x, y: mr.top + p.y}; });
+  const cx = pts.reduce((s,p)=>s+p.x,0)/pts.length, cy = pts.reduce((s,p)=>s+p.y,0)/pts.length;
+  const labels = pts.map(p => ({x:p.x-24, y:p.y-29, w:48, h:40})); // étiquette 4 lettres + point
+  const sizes = AD.map(a => ({w: a.card.offsetWidth, h: a.card.offsetHeight}));
+
+  // positions candidates pour chaque AD (calculées une fois)
+  const cands = AD.map((a, i) => {
+    const p = pts[i], {w, h} = sizes[i], away = Math.atan2(p.y - cy, p.x - cx), list = [];
+    for (let d = 14; d <= 360; d += 20) for (let k = 0; k < 24; k++) {
+      const ang = k * Math.PI / 12, ex = Math.cos(ang), ey = Math.sin(ang);
+      const t = Math.min(Math.abs(ex) > 1e-6 ? (w/2)/Math.abs(ex) : 1e9, Math.abs(ey) > 1e-6 ? (h/2)/Math.abs(ey) : 1e9);
+      const r = {x: p.x + ex*(t+d) - w/2, y: p.y + ey*(t+d) - h/2, w, h};
+      if (r.x < mr.left + 4 || r.y < mr.top + 4 || r.x + w > mr.right - 4 || r.y + h > mr.bottom - 4) continue;
+      let diff = Math.abs(ang - away) % (2*Math.PI); if (diff > Math.PI) diff = 2*Math.PI - diff;
+      if (labels.some(l => hit(r, l))) continue; // jamais sur un terrain (y compris le sien)
+      r.base = d * 1.5 + diff * 40;
+      r.end = anchor(p, r);
+      list.push(r);
+    }
+    return list.sort((x, y) => x.base - y.base).slice(0, 160);
+  });
+
+  function run(order){
+    const res = [], segs = [];
+    let total = 0;
+    for (const i of order) {
+      const p = pts[i];
+      let best = null, bs = Infinity;
+      for (const r of cands[i]) {
+        if (r.base >= bs) break; // liste triée : plus rien de mieux
+        let s = r.base;
+        for (const j in res) {
+          const q = res[j];
+          if (hit(r, q)) s += 10000;
+          if (segHit(p, r.end, pts[j], q.end)) s += 2500;       // traits qui se croisent
+          if (segRect(p, r.end, q)) s += 1500;                  // mon trait passe sous un encart
+          if (segRect(pts[j], q.end, r)) s += 1500;             // mon encart couvre un trait
+          if (s >= bs) break;
+        }
+        if (s < bs) { bs = s; best = r; }
+      }
+      best ??= {x: p.x + 20, y: p.y + 20, ...sizes[i], end: p};
+      res[i] = best; total += bs;
+    }
+    return {res, total};
+  }
+
+  // ordres essayés : excentrés d'abord, centraux d'abord, puis des variantes aléatoires (reproductibles)
+  const byDist = AD.map((a,i)=>i).sort((i,j) => Math.hypot(pts[j].x-cx, pts[j].y-cy) - Math.hypot(pts[i].x-cx, pts[i].y-cy));
+  const orders = [byDist, [...byDist].reverse()];
+  let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  for (let n = 0; n < 60; n++) orders.push([...byDist].sort(() => rnd() - .5));
+  let best = null;
+  for (const o of orders) { const r = run(o); if (!best || r.total < best.total) best = r; }
+  AD.forEach((a, i) => { a.card.style.left = best.res[i].x + 'px'; a.card.style.top = best.res[i].y + 'px'; });
+}
+
+function layout(){ placeCards(); drawLines(); }
+
+// Lignes de rappel carte -> aéroport
+function drawLines(){
+  const svg = document.getElementById('lines');
+  const mr = document.getElementById('map').getBoundingClientRect();
+  let s = '';
+  AD.forEach(a => {
+    const p = map.latLngToContainerPoint([a.lat,a.lon]);
+    const x2 = mr.left + p.x, y2 = mr.top + p.y;
+    if (x2<mr.left||x2>mr.right||y2<mr.top||y2>mr.bottom) return;
+    const r = a.card.getBoundingClientRect();
+    const x1 = Math.min(Math.max(x2, r.left), r.right);
+    const y1 = Math.min(Math.max(y2, r.top), r.bottom);
+    s += `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${a.color || '#1ea0e6'}" stroke-width="2" stroke-dasharray="4 3" opacity=".8"/>`;
+  });
+  svg.innerHTML = s;
+}
+map.on('move', drawLines);
+map.on('moveend zoomend resize', layout);
+window.addEventListener('resize', () => { map.invalidateSize(); fit(); layout(); });
+
+// Couleurs terrain : la pire des deux (visibilité / base des nuages BKN, OVC, VV)
+const COLORS = [
+  {n:'ROUGE', bg:'#ff0000', fg:'#fff', vis:0,    cld:0},
+  {n:'AMBRE', bg:'#953735', fg:'#fff', vis:800,  cld:200},
+  {n:'JAUNE', bg:'#ffff00', fg:'#000', vis:1600, cld:300},
+  {n:'VERT',  bg:'#00b050', fg:'#000', vis:3700, cld:700},
+  {n:'BLANC', bg:'#f2f2f2', fg:'#000', vis:5000, cld:1500},
+  {n:'BLEU',  bg:'#0070c0', fg:'#fff', vis:8000, cld:2500},
+];
+function terrainColor(raw){
+  const body = raw.split(/\s(?:TEMPO|BECMG|NOSIG)\b/)[0];
+  let vis = Infinity, cld = Infinity;
+  if (/\bCAVOK\b/.test(body)) vis = 10000;
+  const v = body.match(/\s(\d{4})(?:NDV)?\s/);
+  if (v) vis = v[1] === '9999' ? 10000 : +v[1];
+  for (const m of body.matchAll(/\b(?:BKN|OVC|VV)(\d{3})\b/g)) cld = Math.min(cld, +m[1]*100);
+  let i = COLORS.length - 1;
+  while (i > 0 && (vis < COLORS[i].vis || cld < COLORS[i].cld)) i--;
+  return COLORS[i];
+}
+
+const esc = t => String(t).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+// ---------- Récupération des données, avec redondance ----------
+// Aucune source officielle n'autorise l'accès direct depuis un navigateur (CORS),
+// donc on combine plusieurs relais publics x plusieurs sources de données.
+const RELAYS = [
+  u => ({url:'https://api.allorigins.win/raw?url=' + encodeURIComponent(u)}),
+  u => ({url:'https://api.allorigins.win/get?url=' + encodeURIComponent(u), wrap:true}),
+  u => ({url:'https://api.codetabs.com/v1/proxy/?quest=' + encodeURIComponent(u)}),
+  u => ({url:'https://api.cors.lol/?url=' + encodeURIComponent(u)}),
+  u => ({url:'https://everyorigin.jwvbremen.nl/api/get?url=' + encodeURIComponent(u), wrap:true}),
+  u => ({url:'https://corsproxy.io/?url=' + encodeURIComponent(u)}),
+];
+
+async function fetchText(url, check){
+  const ctrl = new AbortController();
+  setTimeout(() => ctrl.abort(), 10000);
+  try {
+    return await Promise.any(RELAYS.map(async f => {
+      const {url:u, wrap} = f(url);
+      const r = await fetch(u, {signal: ctrl.signal});
+      if (!r.ok) throw 0;
+      let t = await r.text();
+      if (wrap) t = JSON.parse(t).contents;
+      if (!t || !check(t)) throw 0;
+      ctrl.abort(); // on annule les autres relais
+      return t;
+    }));
+  } catch(e) { return null; }
+}
+
+const ids = AD.map(a=>a.id).join(',');
+const strip = (s, re) => s.replace(re, '').replace(/\s+/g,' ').trim();
+
+// Source 1 : data.js à côté de la page, mis à jour par GitHub Actions.
+// Chargé via <script> : fonctionne aussi en ouvrant le fichier en local (file://).
+function srcLocal(){
+  return new Promise(res => {
+    const sc = document.createElement('script');
+    sc.src = 'data.js?' + Date.now();
+    const done = () => { sc.remove(); res(window.METAR_DATA || {}); };
+    sc.onload = done; sc.onerror = done;
+    setTimeout(done, 5000);
+    document.head.appendChild(sc);
+  });
+}
+
+// Source 2 : API aviationweather.gov (NOAA), toutes les stations en une requête
+async function srcAWC(){
+  const out = {};
+  const base = 'https://aviationweather.gov/api/data/';
+  const isArr = t => { try { return Array.isArray(JSON.parse(t)); } catch(e) { return false; } };
+  const [m, t] = await Promise.all([
+    fetchText(`${base}metar?ids=${ids}&format=json&hours=3`, isArr),
+    fetchText(`${base}taf?ids=${ids}&format=json`, isArr),
+  ]);
+  if (m) JSON.parse(m).sort((x,y)=>x.obsTime-y.obsTime).forEach(x => (out[x.icaoId] ??= {}).metar = x.rawOb);
+  if (t) JSON.parse(t).sort((x,y)=>x.issueTime>y.issueTime?1:-1).forEach(x => (out[x.icaoId] ??= {}).taf = x.rawTAF);
+  return out;
+}
+
+// Source 3 : serveur texte NOAA tgftp, une requête par station
+async function srcTGFTP(list){
+  const out = {};
+  const base = 'https://tgftp.nws.noaa.gov/data/';
+  await Promise.all(list.flatMap(({id, kind}) => {
+    const path = kind === 'metar' ? `observations/metar/stations/${id}.TXT` : `forecasts/taf/stations/${id}.TXT`;
+    return fetchText(base + path, t => t.includes(id)).then(t => {
+      if (t) (out[id] ??= {})[kind] = t.split('\n').slice(1).join(' ');
+    });
+  }));
+  return out;
+}
+
+function render(data, status){
+  AD.forEach(a => {
+    const d = data[a.id] || {};
+    const metar = d.metar ? strip(d.metar, /^(METAR|SPECI)\s+/) : null;
+    const taf = d.taf ? strip(d.taf, /^TAF\s+/) : null;
+    const tafc = d.tafc ? strip(d.tafc, /^TAF\s+/) : null;
+    const col = metar ? terrainColor(metar) : null;
+    const badge = a.card.querySelector('.tc');
+    const lbl = a.marker.getElement()?.querySelector('.icao-lbl');
+    if (col) {
+      badge.textContent = col.n; badge.style.background = col.bg; badge.style.color = col.fg; badge.style.display = '';
+      if (lbl) { lbl.style.background = col.bg; lbl.style.color = col.fg; }
+    } else badge.style.display = 'none';
+    // encart entier à la couleur terrain (bordure + bandeau titre)
+    const h2 = a.card.querySelector('h2');
+    a.card.style.borderColor = col ? (col.n === 'BLANC' ? '#9a9a9a' : col.bg) : '';
+    h2.style.background = col ? col.bg : '';
+    h2.style.color = col ? col.fg : '';
+    a.color = col ? (col.n === 'BLANC' ? '#9a9a9a' : col.bg) : null;
+    a.card.querySelector('.body').innerHTML =
+      `<div><span class="lbl">METAR:</span> ${metar ? esc(metar) : '<span class="err">indisponible</span>'}</div>` +
+      (tafc ? `<div class="taf"><span class="lbl">TAF COURT:</span> ${esc(tafc)}</div>` : '') +
+      `<div class="taf"><span class="lbl">${tafc ? 'TAF LONG' : 'TAF'}:</span> ${taf ? esc(taf) : '<span class="err">indisponible</span>'}</div>`;
+  });
+  document.getElementById('status').textContent = status;
+  layout();
+}
+
+// ---------- MODE TEST TEMPORAIRE (index.html?test) : données fictives, toutes les couleurs ----------
+const TEST_DATA = {
+  LFMT: {metar:'METAR LFMT 231200Z 18005KT 0300 FG VV001 12/12 Q1015', taf:'TAF LFMT 231100Z 2312/2412 18005KT 0400 FG VV001 BECMG 2314/2316 3000 BR BKN005 TEMPO 2400/2408 0200 FG VV001'},  // ROUGE
+  LFTW: {metar:'METAR LFTW 231200Z 20008KT 1200 BR OVC003 14/13 Q1016', taf:'TAF LFTW 231100Z 2312/2412 20008KT 1500 BR OVC003 BECMG 2315/2317 6000 BKN010'},                                     // AMBRE
+  LFMO: {metar:'METAR LFMO 231200Z 34012KT 3000 -RA BKN004 15/13 Q1012', taf:'TAF LFMO 231100Z 2312/2412 34012KT 3000 -RA BKN004 TEMPO 2312/2316 1500 RA BKN003 BECMG 2318/2320 9999 SCT030'},     // JAUNE
+  LFMV: {metar:'METAR LFMV 231200Z 36015G25KT 4500 SHRA BKN009 16/12 Q1013', taf:'TAF LFMV 231100Z 2312/2412 36015G25KT 5000 SHRA BKN009 PROB30 TEMPO 2312/2318 2000 TSRA BKN006CB'},              // VERT
+  LFMY: {metar:'METAR LFMY 231200Z 32010KT 7000 BKN018 18/10 Q1014', taf:'TAF LFMY 231100Z 2312/2412 32010KT 7000 BKN018 BECMG 2314/2316 CAVOK'},                                                   // BLANC
+  LFMI: {metar:'METAR LFMI 231200Z 33020KT CAVOK 22/08 Q1018', taf:'TAF LFMI 231100Z 2312/2412 33020G35KT CAVOK TX24/2313Z TN12/2405Z PROB30 TEMPO 2403/2407 3000 BR BECMG 2407/2409 34010KT BECMG 2412/2414 28013KT'}, // BLEU
+  LFML: {metar:'METAR LFML 231200Z 31015KT 9999 SCT012 BKN030 21/09 Q1017', taf:'TAF LFML 231100Z 2312/2412 31015KT 9999 SCT012 BKN030'},                                                          // BLEU (SCT ignoré)
+  LFMC: {metar:'METAR LFMC 231200Z 09005KT 1600 BR BKN008 13/12 Q1011', taf:'TAF LFMC 231100Z 2312/2412 09005KT 2000 BR BKN008'},                                                                  // JAUNE (limite 1600)
+  LFTH: {metar:'METAR LFTH 231200Z 27008KT 9999 BKN006 17/14 Q1015', taf:'TAF LFTH 231100Z 2312/2412 27008KT 9999 BKN006 BECMG 2316/2318 BKN015'},                                                  // JAUNE (nuages 600 ft)
+};
+const TEST = new URLSearchParams(location.search).has('test');
+
+let busy = false;
+async function refresh(){
+  if (TEST) { render(TEST_DATA, '⚠ MODE TEST – données fictives'); return; }
+  if (busy) return; busy = true;
+  const data = {}, used = new Set();
+  const merge = (src, name) => {
+    for (const [id, v] of Object.entries(src)) if (id[0] !== '_') for (const k of ['metar','taf','tafc'])
+      if (v[k] && !data[id]?.[k]) { (data[id] ??= {})[k] = v[k]; used.add(name); }
+  };
+  const hhmm = d => new Date(d).toISOString().slice(11,16) + 'Z';
+
+  // 1) data.js : affichage immédiat
+  const local = await srcLocal();
+  merge(local, 'data.js');
+  const age = local._updated ? (Date.now() - Date.parse(local._updated)) / 60000 : Infinity;
+  if (used.size) render(data, `Données de ${hhmm(local._updated)} via ${local._sources || 'data.js'} – rafraîchi toutes les 5 min`);
+
+  // 2) Relais publics seulement si data.js est absent ou vieux de plus de 30 min
+  if (age > 30) {
+    document.getElementById('status').textContent = (used.size ? 'data.js ancien – ' : '') + 'recherche via relais publics…';
+    const fresh = {};
+    const mergeFresh = src => { for (const [id, v] of Object.entries(src)) for (const k of ['metar','taf','tafc']) if (v[k] && !fresh[id]?.[k]) (fresh[id] ??= {})[k] = v[k]; };
+    mergeFresh(await srcAWC());
+    if (AD.some(a => !fresh[a.id]?.metar)) mergeFresh(await srcTGFTP(AD.filter(a => !fresh[a.id]?.metar).map(a => ({id:a.id, kind:'metar'}))));
+    if (Object.keys(fresh).length) {
+      // les données fraîches remplacent celles de data.js
+      for (const [id, v] of Object.entries(fresh)) data[id] = {...data[id], ...v};
+      render(data, `Données de ${hhmm(Date.now())} via relais publics – rafraîchi toutes les 5 min`);
+    } else if (used.size) {
+      render(data, `Relais indisponibles – données de ${hhmm(local._updated)} (data.js)`);
+    } else {
+      render(data, 'Aucune source disponible pour le moment – nouvel essai dans 5 min');
+    }
+  }
+  busy = false;
+}
+
+map.invalidateSize(); fit(); layout();
+refresh();
+setInterval(refresh, 5*60*1000);
+setTimeout(layout, 300);
+</script>
+</body>
+</html>
