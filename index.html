@@ -37,21 +37,53 @@
   .card .err { color:#b00; }
   .icao-lbl { background:var(--blue); color:#fff; font:bold 11px Verdana; padding:1px 3px; white-space:nowrap; border:1px solid #fff; }
   .dot { width:10px; height:10px; border-radius:50%; background:var(--blue); border:2px solid #fff; }
-  #status { position:fixed; right:12px; bottom:4px; font-size:10px; color:#333; z-index:700; }
+  #status { position:fixed; left:12px; bottom:12px; font:bold 11px Verdana; color:#333; z-index:700;
+            background:rgba(255,255,255,.9); padding:3px 7px; border:2px solid #999; max-width:calc(100% - 24px); }
+  #status.ok { color:#fff; background:#00a040; border-color:#fff; }
+  #status.warn { color:#000; background:#ffc000; border-color:#fff; }
+  #status.bad { color:#fff; background:#d00000; border-color:#fff; }
   /* Mode "sur la carte" : carte plein écran, encarts à côté des AD */
   body.onmap #page { grid-template-columns:1fr; grid-template-rows:1fr; grid-template-areas:"map"; }
   body.onmap #top, body.onmap #bot, body.onmap #left, body.onmap #right { display:contents; }
   body.onmap .card { position:fixed; width:250px; font-size:10px; line-height:1.3; }
   body.onmap .card .lbl { font-size:12px; }
   body.onmap .card h2 { font-size:12px; padding:2px 5px; }
-  @media (max-width:800px){
-    body.onmap .card { position:relative; width:auto; left:auto!important; top:auto!important; }
-    body.onmap #page { display:flex; }
-    #page { display:flex; flex-direction:column; height:auto; }
-    #top,#bot,#left,#right { flex-direction:column; }
-    #map { height:60vh; order:-1; }
-    #lines { display:none; }
+  html, body { height:100%; overflow:hidden; }
+  body.onmap #page { height:100dvh; }
+  /* Tablette : encarts plus étroits */
+  @media (max-width:1100px){
+    body.onmap .card { width:205px; font-size:9px; }
+    body.onmap .card .lbl { font-size:10.5px; }
+    body.onmap .card h2 { font-size:11px; }
   }
+  #phoneMode { position:fixed; top:10px; right:10px; z-index:950; background:#1ea0e6; color:#fff; border:2px solid #fff;
+    font:bold 11px Verdana; padding:4px 8px; box-shadow:2px 2px 0 rgba(0,0,0,.35); }
+  /* Téléphone : encarts ouverts mais réduits */
+  @media (max-width:700px){
+    body.onmap:not(.compact) .card { width:168px; font-size:7.5px; line-height:1.2; border-width:2px; box-shadow:2px 2px 0 rgba(0,0,0,.35); }
+    body.onmap:not(.compact) .card .lbl { font-size:8.5px; }
+    body.onmap:not(.compact) .card h2 { font-size:9px; padding:1px 3px; }
+    body.onmap:not(.compact) .card h2 .tc { font-size:7.5px; padding:0 3px; }
+    body.onmap:not(.compact) .card .body { padding:2px 4px 3px; }
+    body.onmap:not(.compact) .card .taf { margin-top:2px; }
+  }
+  /* Téléphone, mode étiquettes : étiquettes compactes sur la carte, détail au toucher en bas d'écran */
+  body.compact #page { padding:0; }
+  body.compact #map { border:0; }
+  body.compact .card:not(.open) { display:none; }
+  body.compact #lines { display:none; }
+  body.compact .icao-lbl { font-size:13px; padding:3px 5px; cursor:pointer; }
+  body.compact .card { width:auto; cursor:pointer; box-shadow:2px 2px 0 rgba(0,0,0,.35); border-width:2px; }
+  body.compact .card h2 { font-size:11px; padding:2px 4px; white-space:nowrap; }
+  body.compact .card h2 small, body.compact .card .body { display:none; }
+  body.compact .card h2 .tc { float:none; margin-left:5px; font-size:9px; padding:0 3px; }
+  body.compact .card.open { position:fixed; left:6px!important; right:6px; top:auto!important; bottom:6px; width:auto;
+    z-index:900; font-size:11px; box-shadow:0 0 0 100vmax rgba(0,0,0,.25); }
+  body.compact .card.open h2 small, body.compact .card.open .body { display:block; }
+  body.compact .card.open h2 small { display:inline; }
+  body.compact .card.open h2 { white-space:normal; }
+  body.compact .card.open h2::after { content:'✕'; float:right; margin-left:8px; }
+  body.compact #status { left:6px; bottom:6px; }
 </style>
 </head>
 <body class="onmap">
@@ -64,6 +96,7 @@
 </div>
 <svg id="lines"></svg>
 <div id="status">Chargement…</div>
+<button id="phoneMode" style="display:none"></button>
 
 <script>
 // Placement des cartes autour de la carte, selon la géographie
@@ -79,7 +112,7 @@ const AD = [
   {id:'LFTH', name:'TOULON HYERES',       lat:43.0973, lon:6.1460, slot:'bot'},
 ];
 
-const map = L.map('map', {zoomControl:true});
+const map = L.map('map', {zoomControl:true, zoomSnap:0.25, zoomDelta:0.5});
 L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}', {
   maxZoom:13, attribution:'Tiles © Esri'
 }).addTo(map);
@@ -94,11 +127,41 @@ AD.forEach(a => {
   a.card = c;
 });
 
-const onMap = () => document.body.classList.contains('onmap') && innerWidth > 800;
+const onMap = () => true;
+// Téléphone : encarts ouverts par défaut, bouton pour passer en étiquettes seules
+const isPhone = () => innerWidth <= 700 || innerHeight < 450;
+let phoneLabels = false;
+try { phoneLabels = localStorage.getItem('phoneLabels') === '1'; } catch(e) {}
+const isCompact = () => isPhone() && phoneLabels;
+const btn = document.getElementById('phoneMode');
+btn.onclick = () => {
+  phoneLabels = !phoneLabels;
+  try { localStorage.setItem('phoneLabels', phoneLabels ? '1' : '0'); } catch(e) {}
+  applyCompact(); fit(); layout();
+};
+function applyCompact(){
+  const c = isCompact();
+  document.body.classList.toggle('compact', c);
+  btn.style.display = isPhone() ? '' : 'none';
+  btn.textContent = c ? 'Afficher les encarts' : 'Étiquettes seules';
+  if (!c) AD.forEach(a => a.card.classList.remove('open'));
+}
+// Téléphone : toucher un terrain ouvre son détail en bas d'écran ; toucher le détail ou la carte le ferme
+function toggleCard(a){
+  if (!isCompact()) return;
+  const was = a.card.classList.contains('open');
+  AD.forEach(b => b.card.classList.remove('open'));
+  if (!was) { a.card.classList.add('open'); a.card.style.left = a.card.style.top = ''; }
+}
+AD.forEach(a => {
+  a.card.addEventListener('click', e => { e.stopPropagation(); toggleCard(a); });
+  a.marker.on('click', e => { L.DomEvent.stopPropagation(e); toggleCard(a); });
+});
+map.on('click', () => AD.forEach(b => b.card.classList.remove('open')));
 function fit(){
   const pts = AD.map(a=>[a.lat,a.lon]);
-  if (onMap()) map.fitBounds(pts, {paddingTopLeft:[270,130], paddingBottomRight:[270,150]});
-  else map.fitBounds(pts, {padding:[30,30]});
+  const cw = isCompact() ? 50 : Math.min(270, innerWidth * .2), ch = isCompact() ? 40 : Math.min(150, innerHeight * .17);
+  map.fitBounds(pts, {paddingTopLeft:[cw, ch], paddingBottomRight:[cw, ch]});
 }
 
 // Placement des encarts à côté des AD : sans chevauchement, en évitant que les traits se croisent
@@ -116,6 +179,7 @@ function segRect(a, b, r){ // le segment ab traverse-t-il le rectangle r ?
 const anchor = (p, r) => ({x: Math.min(Math.max(p.x, r.x), r.x + r.w), y: Math.min(Math.max(p.y, r.y), r.y + r.h)});
 
 function placeCards(){
+  if (isCompact()) return; // téléphone : pas d'encarts sur la carte
   if (!onMap()) { AD.forEach(a => { a.card.style.left = a.card.style.top = ''; }); return; }
   const mr = document.getElementById('map').getBoundingClientRect();
   const M = 6;
@@ -123,7 +187,10 @@ function placeCards(){
   const pts = AD.map(a => { const p = map.latLngToContainerPoint([a.lat,a.lon]); return {x: mr.left + p.x, y: mr.top + p.y}; });
   const cx = pts.reduce((s,p)=>s+p.x,0)/pts.length, cy = pts.reduce((s,p)=>s+p.y,0)/pts.length;
   const labels = pts.map(p => ({x:p.x-24, y:p.y-29, w:48, h:40})); // étiquette 4 lettres + point
+  const opened = AD.find(a => a.card.classList.contains('open'));
+  opened?.card.classList.remove('open'); // mesurer l'étiquette fermée
   const sizes = AD.map(a => ({w: a.card.offsetWidth, h: a.card.offsetHeight}));
+  opened?.card.classList.add('open');
 
   // positions candidates pour chaque AD (calculées une fois)
   const cands = AD.map((a, i) => {
@@ -175,6 +242,7 @@ function placeCards(){
   let best = null;
   for (const o of orders) { const r = run(o); if (!best || r.total < best.total) best = r; }
   AD.forEach((a, i) => { a.card.style.left = best.res[i].x + 'px'; a.card.style.top = best.res[i].y + 'px'; });
+  AD.forEach(a => { if (a.card.classList.contains('open')) { a.card.style.left = a.card.style.top = ''; } });
 }
 
 function layout(){ placeCards(); drawLines(); }
@@ -188,6 +256,7 @@ function drawLines(){
     const p = map.latLngToContainerPoint([a.lat,a.lon]);
     const x2 = mr.left + p.x, y2 = mr.top + p.y;
     if (x2<mr.left||x2>mr.right||y2<mr.top||y2>mr.bottom) return;
+    if (a.card.classList.contains('open')) return;
     const r = a.card.getBoundingClientRect();
     const x1 = Math.min(Math.max(x2, r.left), r.right);
     const y1 = Math.min(Math.max(y2, r.top), r.bottom);
@@ -197,7 +266,7 @@ function drawLines(){
 }
 map.on('move', drawLines);
 map.on('moveend zoomend resize', layout);
-window.addEventListener('resize', () => { map.invalidateSize(); fit(); layout(); });
+window.addEventListener('resize', () => { applyCompact(); map.invalidateSize(); fit(); layout(); });
 
 // Couleurs terrain : la pire des deux (visibilité / base des nuages BKN, OVC, VV)
 const COLORS = [
@@ -293,6 +362,38 @@ async function srcTGFTP(list){
   return out;
 }
 
+// Date d'un groupe JJHHMM (mois déduit par rapport à maintenant)
+function dayTime(dd, hh, mm = 0){
+  const now = new Date(), d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), dd, hh, mm));
+  if (d - now > 15 * 864e5) d.setUTCMonth(d.getUTCMonth() - 1);
+  if (now - d > 15 * 864e5) d.setUTCMonth(d.getUTCMonth() + 1);
+  return d;
+}
+// Fraîcheur : METAR publiés toutes les 30 min => en retard au-delà de 45 min ; TAF expiré si fin de validité passée
+function freshness(data){
+  const late = [], expired = [], now = Date.now();
+  AD.forEach(a => {
+    const d = data[a.id] || {};
+    const m = d.metar?.match(/\s(\d{2})(\d{2})(\d{2})Z\s/);
+    if (!m || (now - dayTime(+m[1], +m[2], +m[3])) / 6e4 > 45) late.push(a.id);
+    for (const t of [d.taf, d.tafc]) {
+      const v = t?.match(/\s\d{4}\/(\d{2})(\d{2})\s/);
+      if (v) { const end = dayTime(+v[1], +v[2] % 24); if (+v[2] === 24) end.setUTCDate(end.getUTCDate() + 1); if (end < now) expired.push(a.id); }
+    }
+  });
+  return {late, expired};
+}
+function setStatus(data, text){
+  const el = document.getElementById('status');
+  if (!data) { el.className = ''; el.textContent = text; return; }
+  const {late, expired} = freshness(data);
+  const issues = [];
+  if (late.length) issues.push('METAR en retard : ' + late.join(' '));
+  if (expired.length) issues.push('TAF expiré : ' + expired.join(' '));
+  el.className = !issues.length ? 'ok' : late.length > AD.length / 2 ? 'bad' : 'warn';
+  el.textContent = (issues.length ? '⚠ ' + issues.join(' – ') + ' – ' : '✓ À jour – ') + text;
+}
+
 function render(data, status){
   AD.forEach(a => {
     const d = data[a.id] || {};
@@ -317,7 +418,7 @@ function render(data, status){
       (tafc ? `<div class="taf"><span class="lbl">TAF COURT:</span> ${esc(tafc)}</div>` : '') +
       `<div class="taf"><span class="lbl">${tafc ? 'TAF LONG' : 'TAF'}:</span> ${taf ? esc(taf) : '<span class="err">indisponible</span>'}</div>`;
   });
-  document.getElementById('status').textContent = status;
+  setStatus(TEST ? null : data, status);
   layout();
 }
 
@@ -372,7 +473,7 @@ async function refresh(){
   busy = false;
 }
 
-map.invalidateSize(); fit(); layout();
+applyCompact(); map.invalidateSize(); fit(); layout();
 refresh();
 setInterval(refresh, 5*60*1000);
 setTimeout(layout, 300);
