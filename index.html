@@ -290,21 +290,25 @@ function terrainColor(raw){
 }
 
 const esc = t => String(t).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-// ---------- Récupération des données, avec redondance ----------
-// Aucune source officielle n'autorise l'accès direct depuis un navigateur (CORS),
-// donc on combine plusieurs relais publics x plusieurs sources de données.
+// ---------- Récupération des données en direct, à chaque ouverture (rien n'est stocké) ----------
+// Ogimet et la NOAA refusent l'accès direct depuis un navigateur (CORS) : on passe par des relais
+// publics, tous interrogés en parallèle. VATSIM accepte l'accès direct mais ne fournit que les METAR.
 const RELAYS = [
   u => ({url:'https://api.allorigins.win/raw?url=' + encodeURIComponent(u)}),
   u => ({url:'https://api.allorigins.win/get?url=' + encodeURIComponent(u), wrap:true}),
   u => ({url:'https://api.codetabs.com/v1/proxy/?quest=' + encodeURIComponent(u)}),
   u => ({url:'https://api.cors.lol/?url=' + encodeURIComponent(u)}),
   u => ({url:'https://everyorigin.jwvbremen.nl/api/get?url=' + encodeURIComponent(u), wrap:true}),
+  u => ({url:'https://whateverorigin.org/get?url=' + encodeURIComponent(u), wrap:true}),
+  u => ({url:'https://proxy.corsfix.com/?' + u}),
+  u => ({url:'https://cors.eu.org/' + u}),
+  u => ({url:'https://thingproxy.freeboard.io/fetch/' + u}),
   u => ({url:'https://corsproxy.io/?url=' + encodeURIComponent(u)}),
 ];
 
 async function fetchText(url, check){
   const ctrl = new AbortController();
-  setTimeout(() => ctrl.abort(), 10000);
+  const timer = setTimeout(() => ctrl.abort(), 15000);
   try {
     return await Promise.any(RELAYS.map(async f => {
       const {url:u, wrap} = f(url);
@@ -313,54 +317,15 @@ async function fetchText(url, check){
       let t = await r.text();
       if (wrap) t = JSON.parse(t).contents;
       if (!t || !check(t)) throw 0;
-      ctrl.abort(); // on annule les autres relais
+      ctrl.abort(); // premier relais qui répond : on annule les autres
       return t;
     }));
   } catch(e) { return null; }
+  finally { clearTimeout(timer); }
 }
 
-const ids = AD.map(a=>a.id).join(',');
+const IDS = AD.map(a => a.id);
 const strip = (s, re) => s.replace(re, '').replace(/\s+/g,' ').trim();
-
-// Source 1 : data.js à côté de la page, mis à jour par GitHub Actions.
-// Chargé via <script> : fonctionne aussi en ouvrant le fichier en local (file://).
-function srcLocal(){
-  return new Promise(res => {
-    const sc = document.createElement('script');
-    sc.src = 'data.js?' + Date.now();
-    const done = () => { sc.remove(); res(window.METAR_DATA || {}); };
-    sc.onload = done; sc.onerror = done;
-    setTimeout(done, 5000);
-    document.head.appendChild(sc);
-  });
-}
-
-// Source 2 : API aviationweather.gov (NOAA), toutes les stations en une requête
-async function srcAWC(){
-  const out = {};
-  const base = 'https://aviationweather.gov/api/data/';
-  const isArr = t => { try { return Array.isArray(JSON.parse(t)); } catch(e) { return false; } };
-  const [m, t] = await Promise.all([
-    fetchText(`${base}metar?ids=${ids}&format=json&hours=3`, isArr),
-    fetchText(`${base}taf?ids=${ids}&format=json`, isArr),
-  ]);
-  if (m) JSON.parse(m).sort((x,y)=>x.obsTime-y.obsTime).forEach(x => (out[x.icaoId] ??= {}).metar = x.rawOb);
-  if (t) JSON.parse(t).sort((x,y)=>x.issueTime>y.issueTime?1:-1).forEach(x => (out[x.icaoId] ??= {}).taf = x.rawTAF);
-  return out;
-}
-
-// Source 3 : serveur texte NOAA tgftp, une requête par station
-async function srcTGFTP(list){
-  const out = {};
-  const base = 'https://tgftp.nws.noaa.gov/data/';
-  await Promise.all(list.flatMap(({id, kind}) => {
-    const path = kind === 'metar' ? `observations/metar/stations/${id}.TXT` : `forecasts/taf/stations/${id}.TXT`;
-    return fetchText(base + path, t => t.includes(id)).then(t => {
-      if (t) (out[id] ??= {})[kind] = t.split('\n').slice(1).join(' ');
-    });
-  }));
-  return out;
-}
 
 // Date d'un groupe JJHHMM (mois déduit par rapport à maintenant)
 function dayTime(dd, hh, mm = 0){
@@ -369,6 +334,77 @@ function dayTime(dd, hh, mm = 0){
   if (now - d > 15 * 864e5) d.setUTCMonth(d.getUTCMonth() + 1);
   return d;
 }
+const obsTime = raw => { const m = raw?.match(/\s(\d{2})(\d{2})(\d{2})Z\s/); return m ? dayTime(+m[1], +m[2], +m[3]) : null; };
+function tafInfo(raw){
+  const v = raw.match(/\s(\d{2})(\d{2})\/(\d{2})(\d{2})\s/);
+  if (!v) return null;
+  const from = dayTime(+v[1], +v[2] % 24), to = dayTime(+v[3], +v[4] % 24);
+  if (+v[4] === 24) to.setUTCDate(to.getUTCDate() + 1);
+  return {to, issued: obsTime(raw) || from, hours: (to - from) / 36e5};
+}
+
+// Source A : VATSIM, accès direct (METAR seulement, parfois en retard d'un message)
+async function srcVATSIM(){
+  const out = {};
+  try {
+    const r = await fetch('https://metar.vatsim.net/' + IDS.join(','), {signal: AbortSignal.timeout(10000)});
+    if (r.ok) for (const line of (await r.text()).split('\n')) {
+      const id = line.slice(0, 4);
+      if (IDS.includes(id)) out[id] = {metar: line.trim()};
+    }
+  } catch(e) {}
+  return out;
+}
+
+// Source B : Ogimet via relais (METAR/SPECI + TAF court et long, une seule requête)
+async function srcOgimet(){
+  const out = {}, now = new Date(), s = new Date(now - 30 * 36e5);
+  const p = (d, k) => String(d['getUTC' + k]() + (k === 'Month' ? 1 : 0)).padStart(2, '0');
+  const url = 'https://www.ogimet.com/display_metars2.php?lang=en&tipo=ALL&ord=REV&nil=SI&fmt=txt&send=send'
+    + '&lugar=' + IDS.join('+')
+    + `&ano=${s.getUTCFullYear()}&mes=${p(s,'Month')}&day=${p(s,'Date')}&hora=${p(s,'Hours')}`
+    + `&anof=${now.getUTCFullYear()}&mesf=${p(now,'Month')}&dayf=${p(now,'Date')}&horaf=23&minf=59`;
+  const txt = await fetchText(url, t => /^\d{12}\s+(METAR|SPECI|TAF)/m.test(t));
+  if (!txt) return out;
+  const msgs = [];
+  for (const line of txt.split('\n')) {
+    if (line.startsWith('#')) continue;
+    const m = line.match(/^(\d{12})\s+(.*)$/);
+    if (m) msgs.push(m[2].trim());
+    else if (msgs.length && line.trim()) msgs[msgs.length - 1] += ' ' + line.trim();
+  }
+  const seen = {};
+  for (let raw of msgs) {
+    raw = raw.replace(/=\s*$/, '').replace(/\s+/g, ' ');
+    const m = raw.match(/^(METAR|SPECI|TAF)\s+(?:(?:COR|AMD)\s+)*([A-Z]{4})\s/);
+    if (!m || !IDS.includes(m[2]) || / NIL$/.test(raw)) continue;
+    const o = (out[m[2]] ??= {}), sn = (seen[m[2]] ??= {});
+    if (m[1] !== 'TAF') {
+      const d = obsTime(raw);
+      if (d && (!sn.metar || d > sn.metar)) { sn.metar = d; o.metar = raw; }
+    } else {
+      const i = tafInfo(raw);
+      if (!i || i.to <= now) continue;             // TAF expiré ou vieux message rediffusé
+      const k = i.hours <= 12 ? 'tafc' : 'taf';    // TAF court / TAF long
+      if (!sn[k] || i.issued >= sn[k]) { sn[k] = i.issued; o[k] = raw; }
+    }
+  }
+  return out;
+}
+
+// Source C : NOAA aviationweather.gov via relais (METAR + TAF, une requête chacun)
+async function srcNOAA(){
+  const out = {}, base = 'https://aviationweather.gov/api/data/';
+  const isArr = t => { try { return Array.isArray(JSON.parse(t)); } catch(e) { return false; } };
+  const [m, t] = await Promise.all([
+    fetchText(`${base}metar?ids=${IDS}&format=json&hours=3`, isArr),
+    fetchText(`${base}taf?ids=${IDS}&format=json`, isArr),
+  ]);
+  if (m) JSON.parse(m).sort((x,y)=>x.obsTime-y.obsTime).forEach(x => (out[x.icaoId] ??= {}).metar = x.rawOb);
+  if (t) JSON.parse(t).sort((x,y)=>x.issueTime>y.issueTime?1:-1).forEach(x => (out[x.icaoId] ??= {}).taf = x.rawTAF);
+  return out;
+}
+
 // Fraîcheur : METAR publiés toutes les 30 min => en retard au-delà de 45 min ; TAF expiré si fin de validité passée
 function freshness(data){
   const late = [], expired = [], now = Date.now();
@@ -390,8 +426,10 @@ function setStatus(data, text){
   const issues = [];
   if (late.length) issues.push('METAR en retard : ' + late.join(' '));
   if (expired.length) issues.push('TAF expiré : ' + expired.join(' '));
-  el.className = !issues.length ? 'ok' : late.length > AD.length / 2 ? 'bad' : 'warn';
-  el.textContent = (issues.length ? '⚠ ' + issues.join(' – ') + ' – ' : '✓ À jour – ') + text;
+  // un terrain sans TAF peut être normal (ex. LFMC) ; si la majorité manque, c'est la source qui est en panne
+  const noTaf = AD.filter(a => !data[a.id]?.taf && !data[a.id]?.tafc).length > AD.length / 2;
+  el.className = !issues.length && !noTaf ? 'ok' : late.length > AD.length / 2 || noTaf ? 'bad' : 'warn';
+  el.textContent = (el.className === 'ok' ? '✓ À jour – ' : '⚠ ' + (issues.length ? issues.join(' – ') + ' – ' : '')) + text;
 }
 
 function render(data, status){
@@ -440,36 +478,30 @@ let busy = false;
 async function refresh(){
   if (TEST) { render(TEST_DATA, '⚠ MODE TEST – données fictives'); return; }
   if (busy) return; busy = true;
-  const data = {}, used = new Set();
-  const merge = (src, name) => {
-    for (const [id, v] of Object.entries(src)) if (id[0] !== '_') for (const k of ['metar','taf','tafc'])
-      if (v[k] && !data[id]?.[k]) { (data[id] ??= {})[k] = v[k]; used.add(name); }
-  };
+  const data = {}, from = {metar:{}, taf:{}};
   const hhmm = d => new Date(d).toISOString().slice(11,16) + 'Z';
-
-  // 1) data.js : affichage immédiat
-  const local = await srcLocal();
-  merge(local, 'data.js');
-  const age = local._updated ? (Date.now() - Date.parse(local._updated)) / 60000 : Infinity;
-  if (used.size) render(data, `Données de ${hhmm(local._updated)} via ${local._sources || 'data.js'} – rafraîchi toutes les 5 min`);
-
-  // 2) Relais publics seulement si data.js est absent ou vieux de plus de 30 min
-  if (age > 30) {
-    document.getElementById('status').textContent = (used.size ? 'data.js ancien – ' : '') + 'recherche via relais publics…';
-    const fresh = {};
-    const mergeFresh = src => { for (const [id, v] of Object.entries(src)) for (const k of ['metar','taf','tafc']) if (v[k] && !fresh[id]?.[k]) (fresh[id] ??= {})[k] = v[k]; };
-    mergeFresh(await srcAWC());
-    if (AD.some(a => !fresh[a.id]?.metar)) mergeFresh(await srcTGFTP(AD.filter(a => !fresh[a.id]?.metar).map(a => ({id:a.id, kind:'metar'}))));
-    if (Object.keys(fresh).length) {
-      // les données fraîches remplacent celles de data.js
-      for (const [id, v] of Object.entries(fresh)) data[id] = {...data[id], ...v};
-      render(data, `Données de ${hhmm(Date.now())} via relais publics – rafraîchi toutes les 5 min`);
-    } else if (used.size) {
-      render(data, `Relais indisponibles – données de ${hhmm(local._updated)} (data.js)`);
-    } else {
-      render(data, 'Aucune source disponible pour le moment – nouvel essai dans 5 min');
+  const summary = () => {
+    const names = k => [...new Set(Object.values(from[k]))].join(' + ');
+    const nT = Object.keys(from.taf).length;
+    return `METAR via ${names('metar') || '—'} · TAF ${nT ? 'via ' + names('taf') : 'indisponibles (relais publics en panne)'} · ${hhmm(Date.now())}`;
+  };
+  // METAR : on garde le plus récent toutes sources confondues. TAF : priorité Ogimet, puis NOAA.
+  const merge = (src, name) => {
+    for (const [id, v] of Object.entries(src)) {
+      const d = (data[id] ??= {});
+      if (v.metar && (!d.metar || obsTime(v.metar) > obsTime(d.metar))) { d.metar = v.metar; from.metar[id] = name; }
+      if ((v.taf || v.tafc) && !d.taf && !d.tafc) { d.taf = v.taf; d.tafc = v.tafc; from.taf[id] = name; }
     }
-  }
+    render(data, summary() + ' – chargement…');
+  };
+  document.getElementById('status').textContent = 'Chargement des données…';
+  await Promise.all([
+    srcVATSIM().then(s => merge(s, 'VATSIM')),
+    srcOgimet().then(s => merge(s, 'Ogimet')),
+  ]);
+  // NOAA seulement si Ogimet n'a pas tout donné
+  if (IDS.some(id => !data[id]?.metar || (!data[id]?.taf && !data[id]?.tafc))) merge(await srcNOAA(), 'NOAA');
+  render(data, summary() + ' – actualisé toutes les 5 min');
   busy = false;
 }
 
