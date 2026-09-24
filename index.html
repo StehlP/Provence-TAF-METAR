@@ -356,6 +356,31 @@ async function srcVATSIM(){
   return out;
 }
 
+// Source A2 : API CheckWX, accès direct avec clé (offre gratuite : 200 requêtes/jour).
+// 2 requêtes par appel (METAR + TAF des 9 terrains) ; appelée au plus toutes les 10 min pour ménager le quota.
+const CHECKWX_KEY = 'ffa4e2df78b44b0cafaa5b780b7184b8'; // ← coller ici la clé API CheckWX
+let checkwxCache = null, checkwxAt = 0;
+async function srcCheckWX(){
+  if (!CHECKWX_KEY) return {};
+  if (checkwxCache && Date.now() - checkwxAt < 10 * 6e4) return checkwxCache;
+  const out = {};
+  const get = async kind => {
+    try {
+      const r = await fetch(`https://api.checkwx.com/${kind}/${IDS.join(',')}`,
+        {headers: {'X-API-Key': CHECKWX_KEY}, signal: AbortSignal.timeout(10000)});
+      return r.ok ? (await r.json()).data || [] : [];
+    } catch(e) { return []; }
+  };
+  const [m, t] = await Promise.all([get('metar'), get('taf')]);
+  for (const raw of m) { const id = raw.match(/^(?:(?:METAR|SPECI|COR)\s+)*([A-Z]{4})\s/)?.[1]; if (IDS.includes(id)) (out[id] ??= {}).metar = raw; }
+  for (const raw of t) {
+    const id = raw.match(/^(?:(?:TAF|AMD|COR)\s+)*([A-Z]{4})\s/)?.[1], i = tafInfo(raw);
+    if (IDS.includes(id) && i) (out[id] ??= {})[i.hours <= 12 ? 'tafc' : 'taf'] = raw;
+  }
+  if (m.length || t.length) { checkwxCache = out; checkwxAt = Date.now(); }
+  return out;
+}
+
 // Source B : Ogimet via relais (METAR/SPECI + TAF court et long, une seule requête)
 async function srcOgimet(){
   const out = {}, now = new Date(), s = new Date(now - 30 * 36e5);
@@ -485,18 +510,21 @@ async function refresh(){
     const nT = Object.keys(from.taf).length;
     return `METAR via ${names('metar') || '—'} · TAF ${nT ? 'via ' + names('taf') : 'indisponibles (relais publics en panne)'} · ${hhmm(Date.now())}`;
   };
-  // METAR : on garde le plus récent toutes sources confondues. TAF : priorité Ogimet, puis NOAA.
+  // METAR : on garde le plus récent toutes sources confondues.
+  // TAF : on garde le plus récemment émis (Ogimet a souvent les TAF amendés en premier).
+  const tafIssued = v => Math.max(...[v.taf, v.tafc].filter(Boolean).map(t => tafInfo(t)?.issued || 0));
   const merge = (src, name) => {
     for (const [id, v] of Object.entries(src)) {
       const d = (data[id] ??= {});
       if (v.metar && (!d.metar || obsTime(v.metar) > obsTime(d.metar))) { d.metar = v.metar; from.metar[id] = name; }
-      if ((v.taf || v.tafc) && !d.taf && !d.tafc) { d.taf = v.taf; d.tafc = v.tafc; from.taf[id] = name; }
+      if ((v.taf || v.tafc) && (!(d.taf || d.tafc) || tafIssued(v) > tafIssued(d))) { d.taf = v.taf; d.tafc = v.tafc; from.taf[id] = name; }
     }
     render(data, summary() + ' – chargement…');
   };
   document.getElementById('status').textContent = 'Chargement des données…';
   await Promise.all([
     srcVATSIM().then(s => merge(s, 'VATSIM')),
+    srcCheckWX().then(s => merge(s, 'CheckWX')),
     srcOgimet().then(s => merge(s, 'Ogimet')),
   ]);
   // NOAA seulement si Ogimet n'a pas tout donné
@@ -507,7 +535,9 @@ async function refresh(){
 
 applyCompact(); map.invalidateSize(); fit(); layout();
 refresh();
-setInterval(refresh, 5*60*1000);
+// Actualisation toutes les 5 min, en pause quand l'onglet est caché (économise le quota CheckWX)
+setInterval(() => { if (!document.hidden) refresh(); }, 5*60*1000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
 setTimeout(layout, 300);
 </script>
 </body>
